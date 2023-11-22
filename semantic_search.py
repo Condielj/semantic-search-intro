@@ -1,8 +1,8 @@
 import os
-import json
 import time
 import weaviate
 import pandas as pd
+from format_input import format_input_df
 
 
 def get_client() -> weaviate.Client:
@@ -18,7 +18,7 @@ def get_client() -> weaviate.Client:
 
 
 def embed(
-    path_to_data: str = "data.csv",
+    path_to_restriction_data: str = "data.csv",
     client: weaviate.Client = None,
     vectorizer: str = "openai",
 ) -> None:
@@ -47,7 +47,7 @@ def embed(
         "item",
         "restriction",
     ]
-    df = pd.read_csv(path_to_data)[interesting_columns]
+    df = pd.read_csv(path_to_restriction_data)[interesting_columns]
     data = df.to_dict(orient="records")
 
     # Add data to Weaviate
@@ -69,9 +69,9 @@ def embed(
     return
 
 
-def query(
+def closest_neighbor_query(
     text: str, hs_code: str, client: weaviate.Client = None, vectorizer: str = "openai"
-) -> None:
+) -> dict:
     if client is None:
         client = get_client()
 
@@ -86,29 +86,72 @@ def query(
                 "operands": [
                     {
                         "path": "hs_code",
-                        "operator": "ContainsAll",
-                        "valueText": [hs_code],
+                        "operator": "Like",
+                        "valueText": f"{hs_code}*",
                     },
-                    {"path": "hs_code", "operator": "Equal", "valueText": "'00"},
+                    {"path": "hs_code", "operator": "Equal", "valueText": "0"},
                 ],
             }
         )
         .with_additional(["distance"])
+        .with_limit(1)
         .do()
     )
 
-    print(json.dumps(response, indent=2))
     return response
 
 
 if __name__ == "__main__":
-    vectorizer = ["openai", "cohere"][0]
+    vectorizers = ["openai", "cohere"]
     skip_embed = True
     client = get_client()
+
     if not skip_embed:
-        embed(
-            path_to_data="data/canada_import_restrictions.csv",
-            client=client,
-            vectorizer=vectorizer,
-        )
-    query("bromofluorocarbon", "290319", client=client, vectorizer=vectorizer)
+        for vectorizer in vectorizers:
+            embed(
+                path_to_restriction_data="data/canada_restrictions.csv",
+                client=client,
+                vectorizer=vectorizer,
+            )
+
+    queries = pd.read_csv("data/walmart_input.csv", encoding="latin1")
+    # Strip the periods out of the hs_codes if any
+    queries["hs_code"] = queries["hs_code"].str.replace(".", "")
+
+    for vectorizer in vectorizers:
+        response_item = []
+        response_restriction = []
+        response_distance = []
+        response_error = []
+
+        t1 = time.time()
+        for index, row in queries.iterrows():
+            response = closest_neighbor_query(
+                row["description"], row["hs_code"], client=client, vectorizer=vectorizer
+            )
+
+            if response is None:
+                response_item.append("")
+                response_restriction.append("")
+                response_distance.append("")
+                response_error.append("")
+            elif "errors" in response:
+                response_item.append("")
+                response_restriction.append("")
+                response_distance.append("")
+                response_error.append(response["errors"][0]["message"])
+            else:
+                response = response["data"]["Get"][f"Restriction_{vectorizer}"][0]
+                response_item.append(response["item"])
+                response_restriction.append(response["restriction"])
+                response_distance.append(response["_additional"]["distance"])
+                response_error.append("")
+        t2 = time.time()
+        print(f"{vectorizer} took {t2-t1} seconds")
+
+        queries[f"{vectorizer}_response_item"] = response_item
+        queries[f"{vectorizer}_response_restriction"] = response_restriction
+        queries[f"{vectorizer}_response_distance"] = response_distance
+        queries[f"{vectorizer}_response_error"] = response_error
+
+    queries.to_csv("output.csv", index=False)
