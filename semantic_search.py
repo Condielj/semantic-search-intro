@@ -129,7 +129,6 @@ if __name__ == "__main__":
             response = closest_neighbor_query(
                 row["description"], row["hs_code"], client=client, vectorizer=vectorizer
             )
-
             if response is None:
                 response_item.append("")
                 response_restriction.append("")
