@@ -1,9 +1,10 @@
 import os
+import asyncio
 import weaviate
 import pandas as pd
 import weaviate.classes as wvc
 
-WILDCARD = "0"
+WILDCARD = "0"  # Used to represent a restriction that applies to all hs codes
 
 
 def get_client() -> weaviate.Client:
@@ -91,11 +92,18 @@ def get_filters(code: str) -> wvc.Filter:
     """
     Creates filters in order to get only restrictions with applicable hs codes.
     Example: if the code is 0207, then 0, 02, 020, 0207, and anything that starts with 0207 apply,
+            Any restrictions that apply to all hs_codes, represented by WILDCARD, also apply.
 
+    Parameters:
+        code: str
+            The hs code to create filters for
+    Returns
+        wvc.Filter
+            The filters to apply to the query
     """
-    filters = wvc.Filter(path="hs_code").like(f"{code}*") | wvc.Filter(
-        path="hs_code"
-    ).equal(WILDCARD)
+    filters = wvc.Filter(path="hs_code").like(
+        f"{code}*"
+    )  # | wvc.Filter(path="hs_code").equal(WILDCARD) # TODO ENABLE WILDCARD
     built_code = ""
     for c in code:
         built_code += c
@@ -107,8 +115,24 @@ def get_neighbors(
     item_description: str,
     item_hs_code: str,
     client: weaviate.Client,
-    debug=False,
+    debug: bool = False,
 ) -> list:
+    """
+    Returns all of the 'neighbors' of a given item description, filtering on the hs code.
+
+    Parameters:
+        item_description: str
+            The item description to search for
+        item_hs_code: str
+            The hs code to filter on
+        client: weaviate.Client
+            The client connected to the local instance
+        debug: bool
+            Whether or not to print debug statements
+    Returns
+        reponse.objects: list
+            A list of weaviate objects that are neighbors to the given item description
+    """
     restrictions = client.collections.get("Restriction")
 
     response = restrictions.query.near_text(
@@ -135,6 +159,18 @@ def get_neighbors(
 
 
 def process_row(row, client: weaviate.Client) -> list:
+    """
+    Gets the neighbors for a row and returns their data formatted as a list of dictionaries.
+
+    Parameters:
+        row: pd.Series
+            The row to process
+        client: weaviate.Client
+            The client connected to the local instance
+    Returns
+        new_rows: list
+            A list of dictionaries containing the data for the neighbors of the row
+    """
     response_objects = get_neighbors(row["description"], row["hs_code"], client=client)
     new_rows = []
     for object in response_objects:
@@ -157,7 +193,24 @@ def restrict_from_csv(
     filepath: str,
     encoding: str = "utf8",
 ) -> pd.DataFrame:
+    """
+    Gets all neighbors for each item in a csv and formats them into a dataframe.
+
+    Parameters:
+        client: weaviate.Client
+            The client connected to the local instance
+        filepath: str
+            The path to the csv file
+        encoding: str
+            The encoding of the csv file
+    Returns
+        new_rows: list
+            A list of dictionaries containing the data for the neighbors of the row
+    """
     queries = pd.read_csv(filepath, encoding=encoding)
+    queries["hs_code"] = queries["hs_code"].astype(str)
+    queries["hs_code"] = queries["hs_code"].str.replace(".", "")
+
     columns = [
         "hs_code",
         "description",
@@ -171,9 +224,13 @@ def restrict_from_csv(
     for index, row in queries.iterrows():
         if index % 10 == 0:
             print(f"{index}/{len(queries)} rows processed.")
-        new_rows.append(process_row(row, client=client))
+        new_rows.extend(process_row(row, client=client))
 
-    return pd.DataFrame(new_rows, columns=columns)
+    print("hello")
+
+    rdf = pd.DataFrame(new_rows, columns=columns)
+
+    return rdf
 
 
 if __name__ == "__main__":
