@@ -1,7 +1,7 @@
 import os
 import time
+import json
 import openai
-import asyncio
 import weaviate
 import pandas as pd
 import weaviate.classes as wvc
@@ -10,8 +10,8 @@ from config import ROLE_MESSAGE, WILDCARD
 
 def format_input(item: str, restrictions: list[str]) -> str:
     formatted = f"""
-    Item: {item}
-    Restricted:
+    item: {item}
+    categories:
     """
     for i, restriction in enumerate(restrictions):
         formatted += f"{i+1}. {restriction}\n"
@@ -116,9 +116,11 @@ def get_filters(code: str) -> wvc.Filter:
         wvc.Filter
             The filters to apply to the query
     """
-    filters = wvc.Filter(path="hs_code").like(
-        f"{code}*"
-    )  # | wvc.Filter(path="hs_code").equal(WILDCARD) # TODO ENABLE WILDCARD
+    filters = wvc.Filter(path="hs_code").like(f"{code}*") | wvc.Filter(
+        path="hs_code"
+    ).equal(
+        WILDCARD
+    )  # TODO ENABLE WILDCARD
     built_code = ""
     for c in code:
         built_code += c
@@ -173,6 +175,31 @@ def get_neighbors(
     return response.objects
 
 
+def get_openai_response(input) -> str:
+    """
+    Gets a response from OpenAI.
+
+    Parameters:
+        input: str
+    Returns
+        response: str
+            The response from OpenAI
+    """
+    return openai_client.chat.completions.with_raw_response.create(
+        messages=[
+            {
+                "role": "system",
+                "content": ROLE_MESSAGE,
+            },
+            {
+                "role": "user",
+                "content": input,
+            },
+        ],
+        model="gpt-3.5-turbo",
+    )
+
+
 def process_row(
     row, weaviate_client: weaviate.Client, openai_client: openai.OpenAI
 ) -> list:
@@ -192,10 +219,10 @@ def process_row(
     response_objects = get_neighbors(
         row["description"], row["hs_code"], weaviate_client=weaviate_client
     )
-    print(f"Time to get neighbors: {time.time() - t1}")
+    time_to_get_neighbors = time.time() - t1
     new_rows = []
     restricted_items = []
-    for i, object in enumerate(response_objects):
+    for object in response_objects:
         o = object.properties
         # Create restricted item list
         restricted_items.append(o["item"])
@@ -210,51 +237,114 @@ def process_row(
                 "restricted_item": "",
                 "restriction": "",
                 "distance": 0,
+                "time_to_get_neighbors": time_to_get_neighbors,
+                "time_to_get_response": "NA",
+                "time_to_process_row": time.time() - t1,
+                "prompt_tokens": "NA",
+                "completion_tokens": "NA",
+                "total_tokens": "NA",
             }
         )
-        return new_rows
+        return new_rows, time_to_get_neighbors, "NA", time.time() - t1, "NA", "NA", "NA"
 
     # Create input
     input = format_input(row["description"], restricted_items)
 
     # Send to OpenAI
     t2 = time.time()
-    response = openai_client.chat.completions.with_raw_response.create(
-        messages=[
-            {
-                "role": "system",
-                "content": ROLE_MESSAGE,
-            },
-            {
-                "role": "user",
-                "content": input,
-            },
-        ],
-        model="gpt-3.5-turbo",
-    )
-    print(f"Time to get response: {time.time() - t2}")
-
+    response = get_openai_response(input)
+    time_to_get_response = time.time() - t2
+    response = json.loads(response.text)
+    prompt_tokens = response["usage"]["prompt_tokens"]
+    completion_tokens = response["usage"]["completion_tokens"]
+    total_tokens = response["usage"]["total_tokens"]
     # Parse response
-    print(response)
+    if response["choices"][0]["finish_reason"] != "stop":
+        raise Exception("OpenAI did not finish processing the prompt.")
+    choices = (
+        response["choices"][0]["message"]["content"]
+        .replace("\n", "")
+        .replace(" ", "")
+        .split(",")
+    )
 
-    # new_rows.append(
-    #     {
-    #         "hs_code": row["hs_code"],
-    #         "description": row["description"],
-    #         "restricted_codes": o["hs_code"],
-    #         "restricted_item": o["item"],
-    #         "restriction": o["restriction_text"],
-    #         "distance": object.metadata.distance,
-    #     }
-    # )
-    print(f"Time to process row: {time.time() - t1}"")
-    return new_rows
+    for choice in choices:
+        choice = choice.replace(".", "")
+        if choice == "" or choice == "0":
+            continue
+        try:
+            choice = int(choice)
+        except ValueError:
+            if (
+                "norestrictionsapply" in choice.lower()
+                or "doesnotapply" in choice.lower()
+                or "nocategoryapplies" in choice.lower()
+            ):
+                new_rows.append(
+                    {
+                        "hs_code": row["hs_code"],
+                        "description": row["description"],
+                        "restricted_codes": "",
+                        "restricted_item": "",
+                        "restriction": "",
+                        "distance": 0,
+                        "time_to_get_neighbors": time_to_get_neighbors,
+                        "time_to_get_response": time_to_get_response,
+                        "time_to_process_row": time.time() - t1,
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": total_tokens,
+                    }
+                )
+                return (
+                    new_rows,
+                    time_to_get_neighbors,
+                    time_to_get_response,
+                    time.time() - t1,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                )
+            else:
+                raise Exception("OpenAI returned a non-integer choice.")
+        if choice > len(restricted_items):
+            raise Exception("OpenAI returned a choice that is out of bounds.")
+        # get associated object from response_objects
+        o = response_objects[choice - 1].properties
+        new_rows.append(
+            {
+                "hs_code": row["hs_code"],
+                "description": row["description"],
+                "restricted_codes": o["hs_code"],
+                "restricted_item": o["item"],
+                "restriction": o["restriction_text"],
+                "distance": response_objects[choice - 1].metadata.distance,
+                "time_to_get_neighbors": time_to_get_neighbors,
+                "time_to_get_response": time_to_get_response,
+                "time_to_process_row": time.time() - t1,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            }
+        )
+
+    time_to_process_row = time.time() - t1
+    return (
+        new_rows,
+        time_to_get_neighbors,
+        time_to_get_response,
+        time_to_process_row,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+    )
 
 
 def restrict_from_csv(
     weaviate_client: weaviate.Client,
     openai_client: openai.OpenAI,
     filepath: str,
+    output_path: str,
     encoding: str = "utf8",
 ) -> pd.DataFrame:
     """
@@ -275,6 +365,14 @@ def restrict_from_csv(
     queries["hs_code"] = queries["hs_code"].astype(str)
     queries["hs_code"] = queries["hs_code"].str.replace(".", "")
 
+    # Times & Tokens
+    time_to_get_neighbors_list = []
+    time_to_get_response_list = []
+    time_to_process_row_list = []
+    prompt_tokens_list = []
+    completion_tokens_list = []
+    total_tokens_list = []
+
     columns = [
         "hs_code",
         "description",
@@ -282,22 +380,61 @@ def restrict_from_csv(
         "restricted_item",
         "restriction",
         "distance",
+        "time_to_get_neighbors",
+        "time_to_get_response",
+        "time_to_process_row",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
     ]
 
     new_rows = []
     for index, row in queries.iterrows():
         if index % 10 == 0:
             print(f"{index}/{len(queries)} rows processed.")
-        new_rows.extend(
-            process_row(
-                row, weaviate_client=weaviate_client, openai_client=openai_client
-            )
+        (
+            processed_row,
+            time_to_get_neighbors,
+            time_to_get_response,
+            time_to_process_row,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        ) = process_row(
+            row, weaviate_client=weaviate_client, openai_client=openai_client
         )
+        new_rows.extend(processed_row)
+        if time_to_get_neighbors != "NA":
+            time_to_get_neighbors_list.append(time_to_get_neighbors)
+        if time_to_get_response != "NA":
+            time_to_get_response_list.append(time_to_get_response)
+        if time_to_process_row != "NA":
+            time_to_process_row_list.append(time_to_process_row)
+        if prompt_tokens != "NA":
+            prompt_tokens_list.append(prompt_tokens)
+        if completion_tokens != "NA":
+            completion_tokens_list.append(completion_tokens)
+        if total_tokens != "NA":
+            total_tokens_list.append(total_tokens)
 
-    print("hello")
+    print(f"Finished processing {len(queries)} rows.")
+    print(
+        f"Average time to get neighbors: {sum(time_to_get_neighbors_list)/len(time_to_get_neighbors_list)}"
+    )
+    print(
+        f"Average time to get response: {sum(time_to_get_response_list)/len(time_to_get_response_list)}"
+    )
+    print(
+        f"Average time to process row: {sum(time_to_process_row_list)/len(time_to_process_row_list)}"
+    )
+    print(f"Average prompt tokens: {sum(prompt_tokens_list)/len(prompt_tokens_list)}")
+    print(
+        f"Average completion tokens: {sum(completion_tokens_list)/len(completion_tokens_list)}"
+    )
+    print(f"Average total tokens: {sum(total_tokens_list)/len(total_tokens_list)}")
 
     rdf = pd.DataFrame(new_rows, columns=columns)
-
+    rdf.to_csv(output_path, index=False)
     return rdf
 
 
@@ -312,6 +449,7 @@ if __name__ == "__main__":
 
     restrict_from_csv(
         filepath="data/walmart_input.csv",
+        output_path="data/walmart_output.csv",
         encoding="latin1",
         weaviate_client=weaviate_client,
         openai_client=openai_client,
