@@ -1,4 +1,5 @@
 import os
+import time
 import openai
 import asyncio
 import weaviate
@@ -187,9 +188,11 @@ def process_row(
         new_rows: list
             A list of dictionaries containing the data for the neighbors of the row
     """
+    t1 = time.time()
     response_objects = get_neighbors(
         row["description"], row["hs_code"], weaviate_client=weaviate_client
     )
+    print(f"Time to get neighbors: {time.time() - t1}")
     new_rows = []
     restricted_items = []
     for i, object in enumerate(response_objects):
@@ -215,6 +218,7 @@ def process_row(
     input = format_input(row["description"], restricted_items)
 
     # Send to OpenAI
+    t2 = time.time()
     response = openai_client.chat.completions.with_raw_response.create(
         messages=[
             {
@@ -228,6 +232,7 @@ def process_row(
         ],
         model="gpt-3.5-turbo",
     )
+    print(f"Time to get response: {time.time() - t2}")
 
     # Parse response
     print(response)
@@ -242,6 +247,7 @@ def process_row(
     #         "distance": object.metadata.distance,
     #     }
     # )
+    print(f"Time to process row: {time.time() - t1}"")
     return new_rows
 
 
